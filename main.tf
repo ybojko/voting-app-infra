@@ -56,8 +56,8 @@ module "eks" {
   eks_managed_node_groups = {
     default = {
       min_size       = 1
-      max_size       = 3
-      desired_size   = 3
+      max_size       = 5
+      desired_size   = 4
       instance_types = ["t3.small"]
     }
   }
@@ -151,6 +151,85 @@ resource "aws_secretsmanager_secret" "grafana_oauth_client_secret" {
 resource "aws_secretsmanager_secret_version" "grafana_oauth_client_secret" {
   secret_id     = aws_secretsmanager_secret.grafana_oauth_client_secret.id
   secret_string = var.grafana_oauth_client_secret
+}
+
+# --- Attach ECR read-only policy to node IAM role ---
+data "aws_iam_role" "eks_node_role" {
+  name = module.eks.eks_managed_node_groups["default"].iam_role_name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_node_ecr_readonly" {
+  role       = data.aws_iam_role.eks_node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+# --- GitHub OIDC Identity Provider ---
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
+
+# --- IAM Role for GitHub Actions ECR Push (OIDC) ---
+resource "aws_iam_role" "github_actions_ecr_push" {
+  name               = "github-actions-ecr-push"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = aws_iam_openid_connect_provider.github.arn
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringLike = {
+            "token.actions.githubusercontent.com:sub": "repo:ybojko/voting-app-*"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Environment = "dev"
+    Project     = "voting-app"
+  }
+}
+
+# --- ECR Push Policy for GitHub Actions ---
+resource "aws_iam_role_policy" "github_actions_ecr_push" {
+  name   = "ecr-push-policy"
+  role   = aws_iam_role.github_actions_ecr_push.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:PutImage",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:DescribeRepositories",
+          "ecr:ListImages"
+        ]
+        Resource = [
+          for repo in module.ecr.repository_arns : "${repo}"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
 
 # --- ВЛАСНИЙ МОДУЛЬ: ECR repositories ---

@@ -44,3 +44,13 @@ output "grafana_oauth_client_secret_arn" {
   description = "ARN of the Grafana OAuth client secret in AWS Secrets Manager"
   value       = aws_secretsmanager_secret.grafana_oauth_client_secret.arn
 }
+
+output "github_actions_ecr_push_role_arn" {
+  description = "IAM role ARN for GitHub Actions ECR push (OIDC)"
+  value       = aws_iam_role.github_actions_ecr_push.arn
+}
+
+output "github_oidc_provider_arn" {
+  description = "GitHub OIDC provider ARN"
+  value       = aws_iam_openid_connect_provider.github.arn
+}
