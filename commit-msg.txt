@@ -1,8 +1,0 @@
-Phase 9: add grafana_oauth_client_secret to AWS Secrets Manager + ESO IRSA
-
-- Add grafana_oauth_client_secret variable (sensitive)
-- Add aws_secretsmanager_secret + _version for grafana OAuth client secret
-- Add ESO IRSA module (iam-role-for-service-accounts-eks)
-- Add outputs for all secrets and ESO role ARN
-
-Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
