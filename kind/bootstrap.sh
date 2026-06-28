@@ -138,7 +138,7 @@ kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret docker-registry ghcr-secret \
   --docker-server=ghcr.io \
   --docker-username="${GHCR_USERNAME}" \
-  --docker-password="${GHCR_PASSWORD}" \
+  --docker-password="${GITHUB_TOKEN}" \
   -n voting --dry-run=client -o yaml | kubectl apply -f -
 
 # PostgreSQL password
@@ -173,7 +173,7 @@ kubectl create secret generic repo-voting-app-gitops \
   --from-literal=type=git \
   --from-literal=url="${GITOPS_REPO}" \
   --from-literal=username=ybojko \
-  --from-literal=password="${GITOPS_REPO_TOKEN}" \
+  --from-literal=password="${GITHUB_TOKEN}" \
   -n argocd --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl label secret repo-voting-app-gitops -n argocd argocd.argoproj.io/secret-type=repository --overwrite
