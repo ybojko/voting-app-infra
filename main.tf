@@ -61,6 +61,78 @@ module "vpc" {
   }
 }
 
+# --- Destroy-time cleanup: remove NLB/ENIs (Envoy Gateway leftovers) перед VPC destroy ---
+# Terraform destroys in reverse creation order, тому цей ресурс (створений після VPC)
+# буде знищений ПЕРЕД VPC, і його destroy provisioner очистить залежності.
+resource "null_resource" "vpc_destroy_cleanup" {
+  # depends_on гарантує, що при destroy цей ресурс знищиться ПЕРЕД VPC
+  depends_on = [module.vpc]
+
+  triggers = {
+    cluster_name = var.cluster_name
+    region       = var.region
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<CMD
+      set -e
+      echo "==> Pre-destroy cleanup for cluster ${self.triggers.cluster_name}"
+      VPC_ID=$(aws ec2 describe-vpcs --region ${self.triggers.region} \
+        --filters "Name=tag:Name,Values=${self.triggers.cluster_name}-vpc" \
+        --output text --query "Vpcs[0].VpcId" 2>/dev/null || echo "")
+      if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+        echo "VPC not found, skipping cleanup"
+        exit 0
+      fi
+      echo "Found VPC: $VPC_ID"
+
+      # Видалити classic ELB
+      for lb in $(aws elb describe-load-balancers --region ${self.triggers.region} \
+        --output text --query "LoadBalancerDescriptions[?VPCId=='$VPC_ID'].LoadBalancerName" 2>/dev/null); do
+        echo "Deleting ELB: $lb"
+        aws elb delete-load-balancer --load-balancer-name "$lb" --region ${self.triggers.region} || true
+      done
+
+      # Видалити ALB/NLB v2
+      for lb_arn in $(aws elbv2 describe-load-balancers --region ${self.triggers.region} \
+        --output text --query "LoadBalancers[?VPCId=='$VPC_ID'].LoadBalancerArn" 2>/dev/null); do
+        echo "Deleting ELBv2: $lb_arn"
+        aws elbv2 delete-load-balancer --load-balancer-arn "$lb_arn" --region ${self.triggers.region} || true
+      done
+
+      echo "Waiting for LBs to be deleted..."
+      sleep 30
+
+      # Видалити доступні ENI
+      for eni in $(aws ec2 describe-network-interfaces --region ${self.triggers.region} \
+        --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+        --output text --query "NetworkInterfaces[*].NetworkInterfaceId" 2>/dev/null); do
+        echo "Deleting ENI: $eni"
+        aws ec2 delete-network-interface --network-interface-id "$eni" --region ${self.triggers.region} || true
+      done
+
+      # Видалити не-default security groups
+      for sg in $(aws ec2 describe-security-groups --region ${self.triggers.region} \
+        --filters "Name=vpc-id,Values=$VPC_ID" \
+        --output text --query "SecurityGroups[?GroupName!='default'].GroupId" 2>/dev/null); do
+        echo "Deleting SG: $sg"
+        aws ec2 delete-security-group --group-id "$sg" --region ${self.triggers.region} || true
+      done
+
+      # Звільнити EIP
+      for alloc in $(aws ec2 describe-addresses --region ${self.triggers.region} \
+        --filters "Name=domain,Values=vpc" \
+        --output text --query "Addresses[?AssociationId==null || NetworkInterfaceId==null].AllocationId" 2>/dev/null); do
+        echo "Releasing EIP: $alloc"
+        aws ec2 release-address --allocation-id "$alloc" --region ${self.triggers.region} || true
+      done
+
+      echo "==> Cleanup complete"
+    CMD
+  }
+}
+
 # --- EKS (публічний модуль Бабенка) ---
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
