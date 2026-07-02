@@ -2,6 +2,33 @@ provider "aws" {
   region = var.region
 }
 
+# --- Helm + Kubernetes provider (використовує EKS endpoint) ---
+data "aws_eks_cluster_auth" "cluster" {
+  name = module.eks.cluster_name
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.certificate_authority_data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
+      command     = "aws"
+    }
+  }
+}
+
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.certificate_authority_data)
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
+    command     = "aws"
+  }
+}
+
 # --- VPC (публічний модуль Бабенка) ---
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
@@ -238,4 +265,241 @@ module "ecr" {
 
   repositories = ["voting-app-vote", "voting-app-result", "voting-app-worker"]
   environment  = "dev"
+}
+
+# =============================================================================
+# POST-EKS: Add-ons, Security, Gateway, ArgoCD — все автоматично
+# =============================================================================
+
+# --- EBS CSI Driver ---
+resource "aws_eks_addon" "ebs_csi" {
+  cluster_name = module.eks.cluster_name
+  addon_name   = "aws-ebs-csi-driver"
+
+  depends_on = [module.eks.eks_managed_node_groups]
+}
+
+# --- AmazonEBSCSIDriverPolicy on node IAM role ---
+resource "aws_iam_role_policy_attachment" "eks_node_ebs_csi" {
+  role       = data.aws_iam_role.eks_node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+
+  depends_on = [module.eks.eks_managed_node_groups]
+}
+
+# --- Cross-node Security Group self-reference ---
+resource "aws_vpc_security_group_ingress_rule" "node_self" {
+  security_group_id = module.eks.node_security_group_id
+
+  referenced_security_group_id = module.eks.node_security_group_id
+  ip_protocol                  = "-1"
+
+  depends_on = [module.eks.eks_managed_node_groups]
+}
+
+# --- Wait for EKS to be fully ready before Helm/K8s ---
+resource "time_sleep" "eks_wait" {
+  depends_on = [
+    module.eks,
+    aws_eks_addon.ebs_csi,
+    aws_iam_role_policy_attachment.eks_node_ebs_csi,
+    aws_vpc_security_group_ingress_rule.node_self,
+  ]
+
+  create_duration = "60s"
+}
+
+# --- Gateway API CRDs ---
+resource "null_resource" "gateway_crds" {
+  depends_on = [time_sleep.eks_wait]
+
+  provisioner "local-exec" {
+    command = "kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml"
+  }
+}
+
+# --- Envoy Gateway ---
+resource "helm_release" "envoy_gateway" {
+  depends_on = [null_resource.gateway_crds]
+
+  name             = "eg"
+  repository       = "oci://docker.io/envoyproxy"
+  chart            = "gateway-helm"
+  version          = "1.2.0"
+  namespace        = "envoy-gateway"
+  create_namespace = true
+  skip_crds        = true
+}
+
+# --- GatewayClass ---
+resource "null_resource" "gatewayclass" {
+  depends_on = [helm_release.envoy_gateway]
+
+  provisioner "local-exec" {
+    command = "kubectl apply -f - <<EOF\napiVersion: gateway.networking.k8s.io/v1\nkind: GatewayClass\nmetadata:\n  name: eg\nspec:\n  controllerName: gateway.envoyproxy.io/gatewayclass-controller\nEOF\n"
+  }
+}
+
+# --- ArgoCD ---
+resource "helm_release" "argocd" {
+  depends_on = [null_resource.gatewayclass]
+
+  name             = "argocd"
+  repository       = "https://argoproj.github.io/argo-helm"
+  chart            = "argo-cd"
+  version          = "7.7.23"
+  namespace        = "argocd"
+  create_namespace = true
+
+  set {
+    name  = "dex.enabled"
+    value = "false"
+  }
+  set {
+    name  = "notifications.enabled"
+    value = "false"
+  }
+  set {
+    name  = "applicationSet.enabled"
+    value = "false"
+  }
+}
+
+# --- ArgoCD repo secret ---
+resource "kubernetes_secret" "repo_gitops" {
+  depends_on = [helm_release.argocd]
+
+  metadata {
+    name      = "repo-voting-app-gitops"
+    namespace = "argocd"
+    labels = {
+      "argocd.argoproj.io/secret-type" = "repository"
+    }
+  }
+
+  data = {
+    type     = "git"
+    url      = "https://github.com/ybojko/voting-app-gitops.git"
+    username = "ybojko"
+    password = var.github_token
+  }
+}
+
+# --- ArgoCD root-app (App-of-Apps) ---
+resource "null_resource" "root_app" {
+  depends_on = [kubernetes_secret.repo_gitops]
+
+  provisioner "local-exec" {
+    command = "kubectl apply -f - <<EOF\napiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: root-app\n  namespace: argocd\nspec:\n  project: default\n  source:\n    repoURL: https://github.com/ybojko/voting-app-gitops.git\n    targetRevision: master\n    path: apps\n    directory:\n      recurse: true\n      include: '*.yaml'\n      exclude: 'root-app.yaml'\n  destination:\n    server: https://kubernetes.default.svc\n    namespace: argocd\n  syncPolicy:\n    automated:\n      prune: true\n      selfHeal: true\nEOF\n"
+  }
+}
+
+# --- Pre-create secrets for ESO consumers (avoids race conditions) ---
+resource "kubernetes_secret" "postgres_password" {
+  depends_on = [helm_release.argocd]
+
+  metadata {
+    name      = "postgres-password"
+    namespace = "voting"
+  }
+
+  data = {
+    "postgres-password" = var.postgres_password
+  }
+}
+
+resource "kubernetes_secret" "postgres_password_keycloak" {
+  depends_on = [helm_release.argocd]
+
+  metadata {
+    name      = "postgres-password"
+    namespace = "keycloak"
+  }
+
+  data = {
+    "postgres-password" = var.postgres_password
+  }
+}
+
+resource "kubernetes_secret" "cloudflare_api_token_kube_system" {
+  depends_on = [helm_release.argocd]
+
+  metadata {
+    name      = "cloudflare-api-token"
+    namespace = "kube-system"
+  }
+
+  data = {
+    cloudflare_api_token = var.cloudflare_api_token
+    cloudflare_api_email = "yurkabojko@gmail.com"
+  }
+}
+
+resource "kubernetes_secret" "cloudflare_api_token_cert_manager" {
+  depends_on = [helm_release.argocd]
+
+  metadata {
+    name      = "cloudflare-api-token"
+    namespace = "cert-manager"
+  }
+
+  data = {
+    "api-token" = var.cloudflare_api_token
+  }
+}
+
+resource "kubernetes_secret" "grafana_oauth_creds" {
+  depends_on = [helm_release.argocd]
+
+  metadata {
+    name      = "grafana-oauth-creds"
+    namespace = "monitoring"
+  }
+
+  data = {
+    GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET = var.grafana_oauth_client_secret
+  }
+}
+
+# --- GHCR pull secret (для приватних image-ів) ---
+resource "kubernetes_secret" "ghcr_secret_voting" {
+  depends_on = [helm_release.argocd]
+
+  metadata {
+    name      = "ghcr-secret"
+    namespace = "voting"
+  }
+
+  type = "kubernetes.io/dockerconfigjson"
+
+  data = {
+    ".dockerconfigjson" = jsonencode({
+      auths = {
+        "ghcr.io" = {
+          auth = base64encode("ybojko:${var.github_token}")
+        }
+      }
+    })
+  }
+}
+
+resource "kubernetes_secret" "ghcr_secret_keycloak" {
+  depends_on = [helm_release.argocd]
+
+  metadata {
+    name      = "ghcr-secret"
+    namespace = "keycloak"
+  }
+
+  type = "kubernetes.io/dockerconfigjson"
+
+  data = {
+    ".dockerconfigjson" = jsonencode({
+      auths = {
+        "ghcr.io" = {
+          auth = base64encode("ybojko:${var.github_token}")
+        }
+      }
+    })
+  }
 }
